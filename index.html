@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Gedanken</title>
+<style>
+:root { color-scheme: light dark; --bg:#f6f6f4; --card:#ffffff; --text:#1d1d1f; --muted:#6b6b70; --accent:#2f6fdb; --danger:#c0392b; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#111111; --card:#1c1c1e; --text:#f2f2f7; --muted:#9a9aa0; --accent:#5b8def; }
+}
+* { box-sizing: border-box; }
+body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text); padding-bottom: 240px; }
+header { position:sticky; top:0; background:var(--bg); padding:14px 16px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #8884; z-index:2; }
+h1 { font-size:20px; margin:0; }
+main { padding:12px 16px; }
+button { font:inherit; border:0; border-radius:12px; padding:10px 14px; background:var(--accent); color:#fff; cursor:pointer; }
+button:disabled { opacity:.5; }
+button.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+button.danger { background:var(--danger); }
+button.active { background:var(--danger); color:#fff; }
+textarea, select, input { width:100%; font:inherit; padding:10px; border-radius:12px; border:1px solid #8886; background:var(--card); color:var(--text); }
+textarea { min-height:90px; resize:vertical; }
+.card { background:var(--card); border-radius:14px; padding:12px 14px; margin:10px 0; }
+.meta { font-size:12px; color:var(--muted); }
+.summary { margin:6px 0; white-space:pre-wrap; font-weight:500; }
+.raw { font-size:14px; color:var(--muted); white-space:pre-wrap; }
+details { margin:8px 0; }
+details > summary { font-weight:600; cursor:pointer; padding:6px 0; font-size:16px; }
+details .sub { margin:4px 0 4px 6px; font-size:13px; color:var(--muted); font-weight:600; }
+.row { display:flex; gap:8px; align-items:center; }
+.row > * { flex:1; }
+.row > .fix { flex:0 0 auto; }
+.composer { position:fixed; bottom:0; left:0; right:0; background:var(--bg); padding:10px 16px calc(10px + env(safe-area-inset-bottom)); border-top:1px solid #8884; }
+.empty { text-align:center; color:var(--muted); margin:40px 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Gedanken</h1>
+  <div class="row fix">
+    <button class="secondary" id="export" title="Exportieren">⇩</button>
+    <button class="secondary" id="settings" title="Einstellungen">⚙</button>
+  </div>
+</header>
+
+<main>
+  <input id="search" placeholder="Suchen …">
+  <div id="list"></div>
+</main>
+
+<div class="composer">
+  <textarea id="input" placeholder="Gedanke eintippen oder einsprechen …"></textarea>
+  <div class="row" style="margin-top:8px">
+    <button class="secondary" id="rec">🎙 Sprechen</button>
+    <button id="save">Speichern &amp; einordnen</button>
+  </div>
+</div>
+
+<script>
+// ===== Konfiguration =====
+// Themen hier anpassen. Die KI ordnet jeden Gedanken genau einem dieser Themen zu.
+const THEMEN = ["Arbeit", "Familie", "Gesundheit", "Ideen", "Projekte", "Persönliches", "Sonstiges"];
+const UNSORTIERT = "Unsortiert";
+
+const LS_ENTRIES = "gedanken.entries";
+const LS_KEY = "gedanken.apiKey";
+const LS_MODEL = "gedanken.model";
+const DEFAULT_MODEL = "gemini-2.5-flash";
+
+// ===== Hilfsfunktionen =====
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+let entries = [];
+try { entries = JSON.parse(localStorage.getItem(LS_ENTRIES)) || []; } catch { entries = []; }
+
+function persist() {
+  localStorage.setItem(LS_ENTRIES, JSON.stringify(entries));
+}
+
+// ===== Spracheingabe (Web Speech API) =====
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognition = null;
+let recording = false;
+
+function toggleRec() {
+  if (recording) { recognition && recognition.stop(); return; }
+  if (!SR) { alert("Spracheingabe wird in diesem Browser nicht unterstützt. Am besten Chrome auf Android nutzen."); return; }
+
+  recognition = new SR();
+  recognition.lang = "de-DE";
+  recognition.continuous = true;
+  recognition.interimResults = true;
+
+  const base = $("#input").value ? $("#input").value.trimEnd() + " " : "";
+  let finalText = "";
+
+  recognition.onresult = (ev) => {
+    let interim = "";
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const r = ev.results[i];
+      if (r.isFinal) finalText += r[0].transcript + " ";
+      else interim += r[0].transcript;
+    }
+    $("#input").value = base + finalText + interim;
+  };
+  recognition.onerror = (ev) => {
+    if (ev.error === "not-allowed") alert("Mikrofon ist nicht erlaubt. Bitte im Browser freigeben.");
+  };
+  recognition.onend = () => {
+    recording = false;
+    $("#rec").classList.remove("active");
+    $("#rec").textContent = "🎙 Sprechen";
+  };
+
+  recognition.start();
+  recording = true;
+  $("#rec").classList.add("active");
+  $("#rec").textContent = "■ Stopp";
+}
+
+// ===== KI-Einordnung (Google Gemini, kostenloses Kontingent) =====
+async function einordnen(text) {
+  const key = localStorage.getItem(LS_KEY);
+  const model = localStorage.getItem(LS_MODEL) || DEFAULT_MODEL;
+  if (!key) throw new Error("Kein API-Schlüssel hinterlegt (⚙ Einstellungen).");
+
+  const prompt = `Du ordnest die Gedanken eines Nutzers.
+Erlaubte Themen: ${THEMEN.join(", ")}.
+Antworte ausschließlich als JSON-Objekt mit diesen Feldern:
+"thema": genau eines der erlaubten Themen, exakt so geschrieben,
+"unterthema": kurzer Name für ein Unterthema (1 bis 3 Wörter) oder leerer String,
+"zusammenfassung": knappe Zusammenfassung in höchstens zwei Sätzen, in der Sprache des Gedankens.
+
+Gedanke:
+"""${text}"""`;
+
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
+    })
+  });
+  if (!res.ok) throw new Error(`API-Fehler ${res.status}: ${(await res.text()).slice(0, 200)}`);
+
+  const data = await res.json();
+  const raw = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  const obj = JSON.parse(raw);
+  return {
+    thema: THEMEN.includes(obj.thema) ? obj.thema : "Sonstiges",
+    unterthema: String(obj.unterthema || "").trim(),
+    zusammenfassung: String(obj.zusammenfassung || "").trim()
+  };
+}
+
+// ===== Speichern =====
+async function speichern() {
+  if (recording) recognition.stop();
+  const text = $("#input").value.trim();
+  if (!text) return;
+
+  const btn = $("#save");
+  btn.disabled = true;
+  btn.textContent = "Ordne ein …";
+
+  const eintrag = {
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    datum: new Date().toISOString(),
+    text,
+    thema: UNSORTIERT,
+    unterthema: "",
+    zusammenfassung: ""
+  };
+
+  try {
+    Object.assign(eintrag, await einordnen(text));
+  } catch (err) {
+    alert("Gespeichert, aber nicht eingeordnet:\n" + err.message);
+  }
+
+  entries.unshift(eintrag);
+  persist();
+  $("#input").value = "";
+  btn.disabled = false;
+  btn.textContent = "Speichern & einordnen";
+  render();
+}
+
+// ===== Anzeige =====
+function karte(e) {
+  const optionen = [...THEMEN, UNSORTIERT]
+    .map(t => `<option ${t === e.thema ? "selected" : ""}>${esc(t)}</option>`).join("");
+  return `
+    <div class="card">
+      <div class="meta">${esc(new Date(e.datum).toLocaleString("de-DE"))}</div>
+      ${e.zusammenfassung ? `<div class="summary">${esc(e.zusammenfassung)}</div>` : ""}
+      <div class="raw">${esc(e.text)}</div>
+      <div class="row" style="margin-top:10px">
+        <select data-theme="${esc(e.id)}">${optionen}</select>
+        <button class="secondary fix" data-sub="${esc(e.id)}">Unterthema</button>
+        <button class="danger fix" data-del="${esc(e.id)}">×</button>
+      </div>
+    </div>`;
+}
+
+function render() {
+  const q = $("#search").value.trim().toLowerCase();
+  const sichtbar = entries.filter(e =>
+    !q || (e.text + " " + e.zusammenfassung + " " + e.unterthema + " " + e.thema).toLowerCase().includes(q));
+
+  if (!entries.length) {
+    $("#list").innerHTML = `<div class="empty">Noch keine Gedanken.<br>Unten eintippen oder 🎙 drücken.</div>`;
+    return;
+  }
+
+  let html = "";
+  for (const th of [...THEMEN, UNSORTIERT]) {
+    const themaEintraege = sichtbar.filter(e => e.thema === th);
+    if (!themaEintraege.length) continue;
+
+    html += `<details open><summary>${esc(th)} <span class="meta">(${themaEintraege.length})</span></summary>`;
+    const subs = [...new Set(themaEintraege.map(e => e.unterthema))].sort((a, b) => a.localeCompare(b, "de"));
+    for (const sub of subs) {
+      if (sub) html += `<div class="sub">${esc(sub)}</div>`;
+      themaEintraege.filter(e => e.unterthema === sub).forEach(e => html += karte(e));
+    }
+    html += `</details>`;
+  }
+  $("#list").innerHTML = html || `<div class="empty">Keine Treffer.</div>`;
+}
+
+// Event-Delegation für Karten
+$("#list").addEventListener("click", (ev) => {
+  const del = ev.target.dataset.del;
+  const sub = ev.target.dataset.sub;
+  if (del) {
+    if (!confirm("Diesen Gedanken löschen?")) return;
+    entries = entries.filter(x => x.id !== del);
+    persist(); render();
+  } else if (sub) {
+    const e = entries.find(x => x.id === sub);
+    const neu = prompt("Unterthema (leer lassen für keins):", e.unterthema);
+    if (neu !== null) { e.unterthema = neu.trim(); persist(); render(); }
+  }
+});
+
+$("#list").addEventListener("change", (ev) => {
+  const id = ev.target.dataset.theme;
+  if (!id) return;
+  const e = entries.find(x => x.id === id);
+  e.thema = ev.target.value;
+  persist(); render();
+});
+
+// ===== Einstellungen & Export =====
+function einstellungen() {
+  const k = prompt("Gemini-API-Schlüssel (bleibt nur auf diesem Gerät):", localStorage.getItem(LS_KEY) || "");
+  if (k !== null) localStorage.setItem(LS_KEY, k.trim());
+  const m = prompt("Gemini-Modell:", localStorage.getItem(LS_MODEL) || DEFAULT_MODEL);
+  if (m !== null && m.trim()) localStorage.setItem(LS_MODEL, m.trim());
+}
+
+function exportieren() {
+  const blob = new Blob([JSON.stringify(entries, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "gedanken-" + new Date().toISOString().slice(0, 10) + ".json";
+  a.click();
+}
+
+// ===== Start =====
+$("#rec").disabled = !SR;
+$("#rec").addEventListener("click", toggleRec);
+$("#save").addEventListener("click", speichern);
+$("#settings").addEventListener("click", einstellungen);
+$("#export").addEventListener("click", exportieren);
+$("#search").addEventListener("input", render);
+render();
+</script>
+</body>
+</html>
